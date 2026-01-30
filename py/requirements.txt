@@ -1,0 +1,7 @@
+# Python dependencies for faxocr-js
+
+# Searchable PDF generation
+PyMuPDF>=1.23.0
+
+# Gemini API for markdown formatting
+google-generativeai>=0.3.0

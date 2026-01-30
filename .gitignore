@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+
+# Output files (generated)
+output/*.json
+output/*.pdf
+output/*.png
+!output/.gitkeep
+
+# Input files (user data)
+input/*.pdf
+input/*.png
+input/*.jpg
+input/*.jpeg
+!input/.gitkeep
+
+# Upload directory (GUI)
+uploads/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Credentials (never commit)
+*.json.key
+*-key.json
+credentials.json
+service-account.json
+
+# Temporary files
+*.tmp
+*.bak
+
+# Test output
+*.test.png

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(export CARGO_TARGET_DIR=\"$TMPDIR/cargo-target/faxocr\")",
+      "Bash(cargo check:*)"
+    ]
+  }
+}
