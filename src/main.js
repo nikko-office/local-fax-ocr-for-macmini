@@ -31,10 +31,12 @@ import {
   fileExists
 } from './io.js';
 
-import { performOcr, computeFileHash } from './vision_ocr.js';
+import { performOcr } from './ocr_provider.js';
+import { computeFileHash } from './vision_ocr.js';
 import { createOcrDocument, extractFullText } from './ocr_schema.js';
 import { suggestRename } from './rename_suggest.js';
 import { runPythonScript } from './python_runner.js';
+import { refineOcrText, refineOcrTextByLines, isLlmEnabled, checkLlmHealth } from './local_llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -63,6 +65,8 @@ function parseCliArgs() {
     force: { type: 'boolean', default: false },
     dpi: { type: 'string', default: '300' },
     gemini: { type: 'boolean', default: false },
+    'llm-refine': { type: 'boolean', default: false },
+    'llm-refine-mode': { type: 'string', default: 'text' },
     'searchable-pdf': { type: 'boolean', default: false },
     'font-path': { type: 'string' },
     'skip-ocr': { type: 'boolean', default: false },
@@ -80,6 +84,8 @@ function parseCliArgs() {
       force: values.force,
       dpi: parseInt(values.dpi, 10),
       gemini: values.gemini,
+      llmRefine: values['llm-refine'],
+      llmRefineMode: values['llm-refine-mode'],
       searchablePdf: values['searchable-pdf'],
       fontPath: values['font-path'],
       skipOcr: values['skip-ocr'],
@@ -112,14 +118,26 @@ Options:
   --dpi <number>      PDF変換時のDPI (default: 300)
   --skip-ocr          既存の.ocr.jsonがあれば再利用
   --gemini            Gemini APIでMarkdown整形を実行
+  --llm-refine        Local LLMでOCRテキストを整形（誤字修正・改行整理）
+  --llm-refine-mode   LLM整形モード: text | lines (default: text)
+                        text: raw_textのみ更新（bbox非同期）
+                        lines: 各行のtextを更新（bbox同期、searchable-pdf向け）
   --searchable-pdf    透明テキスト重畳のPDFを生成
   --font-path <path>  日本語フォントファイルパス（searchable-pdf用）
   -h, --help          ヘルプを表示
   -v, --version       バージョンを表示
 
 Environment:
-  GOOGLE_CLOUD_API_KEY  Google Cloud Vision API キー (必須)
-  GEMINI_API_KEY        Gemini API キー (--gemini使用時に必須)
+  OCR_PROVIDER          OCRプロバイダー: local | google | auto (default: local)
+  LOCAL_OCR_API_URL     Local OCR API URL (default: http://localhost:8765)
+  GOOGLE_CLOUD_API_KEY  Google Cloud Vision API キー (OCR_PROVIDER=google時のみ)
+  GEMINI_API_KEY        Gemini API キー (--gemini使用時のみ)
+  LLM_ENABLED           LLM整形の有効/無効: true | false (default: false)
+  LOCAL_LLM_API_URL     Local LLM API URL (default: http://localhost:1234/v1)
+  LOCAL_LLM_MODEL       LLMモデル名 (default: gemma3)
+
+Prerequisites (完全オフライン運用):
+  docker-compose up -d  # PaddleOCR APIを起動
 
 Examples:
   # フォルダ内の全ファイルをOCR
@@ -160,6 +178,7 @@ async function processSingleFile(filePath, args, apiKey) {
     job_dir: args.outputDir,
     ocr_json: null,
     rename_json: null,
+    llm_refined: null,
     gemini_md: null,
     searchable_pdf: null
   };
@@ -179,9 +198,10 @@ async function processSingleFile(filePath, args, apiKey) {
       log('info', `  Using existing OCR result: ${basename}.ocr.json`);
       ocrDoc = await readJson(ocrOutputPath);
     } else {
-      // Validate API key for OCR
-      if (!apiKey) {
-        throw new Error('GOOGLE_CLOUD_API_KEY is required for OCR');
+      // Validate API key for OCR (only required for non-local providers)
+      const ocrProvider = process.env.OCR_PROVIDER || 'local';
+      if (!apiKey && ocrProvider !== 'local') {
+        throw new Error('GOOGLE_CLOUD_API_KEY is required (set OCR_PROVIDER=local for offline mode)');
       }
 
       // Convert PDF to PNG if needed
@@ -204,7 +224,7 @@ async function processSingleFile(filePath, args, apiKey) {
         const dimensions = await getImageDimensions(imagePath);
 
         // Perform OCR
-        log('info', `  Calling Vision API...`);
+        log('info', `  Calling OCR API (${ocrProvider})...`);
         const visionResponse = await performOcr(imagePath, apiKey);
 
         // Create OcrDocument
@@ -226,6 +246,72 @@ async function processSingleFile(filePath, args, apiKey) {
     }
 
     result.ocr_json = ocrOutputPath;
+
+    // LLM refinement (optional)
+    if (args.llmRefine && isLlmEnabled()) {
+      const mode = args.llmRefineMode || 'text';
+      log('info', `  Running LLM text refinement (mode=${mode})...`);
+
+      // Check LLM health first
+      const llmHealthy = await checkLlmHealth();
+      if (!llmHealthy) {
+        log('warn', `  LLM API not available, skipping refinement`);
+      } else if (mode === 'lines') {
+        // Mode: lines - update each line's text while preserving bbox
+        const allLines = [];
+        const lineRefs = []; // Keep references to original line objects
+
+        for (const page of ocrDoc.pages) {
+          for (const block of page.blocks) {
+            for (const line of block.lines) {
+              allLines.push(line.text);
+              lineRefs.push(line);
+            }
+          }
+        }
+
+        if (allLines.length === 0) {
+          log('warn', `  No lines found in OCR document`);
+        } else {
+          const llmResult = await refineOcrTextByLines(allLines);
+
+          if (llmResult.success) {
+            // Apply refined text to each line (bbox preserved)
+            for (let i = 0; i < lineRefs.length; i++) {
+              lineRefs[i].text = llmResult.lines[i];
+            }
+            // Also update raw_text
+            ocrDoc.raw_text = llmResult.lines.join('\n');
+            ocrDoc.llm_refined = true;
+            ocrDoc.llm_refine_mode = 'lines';
+
+            await writeJson(ocrOutputPath, ocrDoc);
+            log('info', `  LLM refinement complete (${allLines.length} lines)`);
+            result.llm_refined = true;
+          } else {
+            log('warn', `  LLM refinement failed: ${llmResult.error}`);
+            result.llm_refined = false;
+          }
+        }
+      } else {
+        // Mode: text (default) - update raw_text only
+        const rawText = extractFullText(ocrDoc);
+        const llmResult = await refineOcrText(rawText);
+
+        if (llmResult.success) {
+          ocrDoc.raw_text = llmResult.text;
+          ocrDoc.llm_refined = true;
+          ocrDoc.llm_refine_mode = 'text';
+
+          await writeJson(ocrOutputPath, ocrDoc);
+          log('info', `  LLM refinement complete`);
+          result.llm_refined = true;
+        } else {
+          log('warn', `  LLM refinement failed: ${llmResult.error}`);
+          result.llm_refined = false;
+        }
+      }
+    }
 
     // Generate rename suggestion
     const fullText = extractFullText(ocrDoc);
@@ -405,9 +491,11 @@ async function main() {
   }
 
   // Handle batch mode
-  if (!apiKey && !args.skipOcr) {
+  const ocrProvider = process.env.OCR_PROVIDER || 'google';
+  if (!apiKey && !args.skipOcr && ocrProvider !== 'local') {
     console.error('Error: GOOGLE_CLOUD_API_KEY environment variable is not set.');
     console.error('Please set it in your .env file or environment.');
+    console.error('Alternatively, set OCR_PROVIDER=local to use Local OCR API.');
     process.exit(EXIT_CONFIG_ERROR);
   }
 

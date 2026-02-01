@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  ocr-api:
+    build:
+      context: ./ocr-api
+      dockerfile: Dockerfile
+    container_name: faxocr-local-ocr
+    ports:
+      - "8765:8000"
+    environment:
+      # OCR settings
+      - OCR_LANG=japan
+      - OCR_USE_GPU=false
+      - OCR_ENABLE_MKLDNN=false
+      # Preprocessing settings
+      - PREPROCESS_SCALE_FACTOR=2.0
+      - PREPROCESS_BINARIZE=true
+      - PREPROCESS_BINARIZE_THRESHOLD=0
+      # Logging
+      - LOG_LEVEL=INFO
+    volumes:
+      # Persist model cache
+      - ocr-model-cache:/root/.paddleocr
+    restart: unless-stopped
+    # Resource limits (for M4 24GB environment)
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+volumes:
+  ocr-model-cache:

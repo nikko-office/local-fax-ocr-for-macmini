@@ -18,7 +18,13 @@ import {
   extractDrawingNumbers,
   isSelfCompany,
   sanitizeFilename,
-  suggestRename
+  suggestRename,
+  // ミルシート専用関数
+  isMillsheet,
+  extractManufacturer,
+  extractChargeNumber,
+  extractThickness,
+  suggestMillsheetRename
 } from '../src/rename_suggest.js';
 
 describe('extractDate', () => {
@@ -492,5 +498,224 @@ describe('Integration scenarios', () => {
     assert.ok(result.stem.includes('SUS304'));
     // 2+3+5+10 = 20枚 (全ての数量が合計される)
     assert.ok(result.stem.includes('20枚'));
+  });
+});
+
+// ========================================
+// ミルシート専用テスト
+// ========================================
+describe('isMillsheet', () => {
+  it('detects millsheet by keyword ミルシート', () => {
+    const text = `
+      ミルシート
+      SS400
+      東京製鉄
+    `;
+    assert.strictEqual(isMillsheet(text), true);
+  });
+
+  it('detects millsheet by Mill Sheet', () => {
+    const text = `
+      Mill Sheet
+      SS400
+      JFE Steel
+    `;
+    assert.strictEqual(isMillsheet(text), true);
+  });
+
+  it('detects millsheet by 製鋼番号', () => {
+    const text = `
+      製鋼番号: 48D7503
+      SS400
+    `;
+    assert.strictEqual(isMillsheet(text), true);
+  });
+
+  it('does NOT detect 見積書 as millsheet', () => {
+    const text = `
+      御見積書
+      SS400 t=12
+      東京製鉄
+    `;
+    assert.strictEqual(isMillsheet(text), false);
+  });
+
+  it('does NOT detect 注文書 as millsheet', () => {
+    const text = `
+      注文書
+      SS400
+      株式会社テスト 様
+    `;
+    assert.strictEqual(isMillsheet(text), false);
+  });
+
+  it('does NOT detect document with 御中 as millsheet', () => {
+    const text = `
+      日興金属株式会社 御中
+      SS400 板材
+      東京製鉄
+    `;
+    assert.strictEqual(isMillsheet(text), false);
+  });
+});
+
+describe('extractManufacturer', () => {
+  it('extracts 東京製鉄', () => {
+    const text = `東京製鉄株式会社 製品証明書`;
+    const result = extractManufacturer(text);
+    assert.strictEqual(result.value, '東京製鉄');
+  });
+
+  it('extracts 中山製鋼所', () => {
+    const text = `中山製鋼所 ミルシート`;
+    const result = extractManufacturer(text);
+    assert.strictEqual(result.value, '中山製鋼所');
+  });
+
+  it('extracts JFEスチール', () => {
+    const text = `JFEスチール Mill Certificate`;
+    const result = extractManufacturer(text);
+    assert.strictEqual(result.value, 'JFEスチール');
+  });
+
+  it('does NOT extract trading company 小野建', () => {
+    const text = `小野建株式会社`;
+    const result = extractManufacturer(text);
+    assert.strictEqual(result.value, null);
+    assert.ok(result.raw.includes('商社のみ検出'));
+  });
+
+  it('does NOT extract trading company 日興金属', () => {
+    const text = `日興金属`;
+    const result = extractManufacturer(text);
+    assert.strictEqual(result.value, null);
+  });
+});
+
+describe('extractChargeNumber', () => {
+  it('extracts charge number with label 製鋼番号', () => {
+    const text = `製鋼番号: 48D7503`;
+    const result = extractChargeNumber(text);
+    assert.strictEqual(result.value, '48D7503');
+  });
+
+  it('extracts charge number with label Charge No', () => {
+    const text = `Charge No. AD3898`;
+    const result = extractChargeNumber(text);
+    assert.strictEqual(result.value, 'AD3898');
+  });
+
+  it('extracts 中山製鋼所 format (48D7503)', () => {
+    const text = `チャージ 48D7503 SS400`;
+    const result = extractChargeNumber(text, '中山製鋼所');
+    assert.strictEqual(result.value, '48D7503');
+  });
+});
+
+describe('extractThickness', () => {
+  it('extracts thickness from dimension 9×1524×3048', () => {
+    const text = `寸法: 9×1524×3048`;
+    const result = extractThickness(text);
+    assert.strictEqual(result.value, '9t');
+  });
+
+  it('extracts thickness from dimension 12.0×1524×3048', () => {
+    const text = `12.0×1524×3048 mm`;
+    const result = extractThickness(text);
+    assert.strictEqual(result.value, '12t');
+  });
+
+  it('extracts thickness with label 板厚', () => {
+    const text = `板厚: 16mm`;
+    const result = extractThickness(text);
+    assert.strictEqual(result.value, '16t');
+  });
+
+  it('extracts existing t notation', () => {
+    const text = `SS400 9t`;
+    const result = extractThickness(text);
+    assert.strictEqual(result.value, '9t');
+  });
+});
+
+describe('suggestMillsheetRename', () => {
+  it('generates millsheet filename format', () => {
+    const text = `
+      ミルシート
+      発行日: 2024/04/11
+      SS400
+      寸法: 9×1524×3048
+      中山製鋼所
+      製鋼番号: 48D7503
+    `;
+    const result = suggestMillsheetRename(text, 'test.pdf');
+
+    assert.ok(result.reasons.includes('type: millsheet'));
+    assert.ok(result.stem.includes('20240411'));
+    assert.ok(result.stem.includes('SS400'));
+    assert.ok(result.stem.includes('9t'));
+    assert.ok(result.stem.includes('中山製鋼所'));
+    assert.ok(result.stem.includes('48D7503'));
+  });
+
+  it('generates correct filename order: date_material_thickness_manufacturer_charge', () => {
+    const text = `
+      ミルシート
+      発行日: 2024/04/11
+      SS400
+      9×1524×3048
+      中山製鋼所
+      製鋼番号: 48D7503
+    `;
+    const result = suggestMillsheetRename(text, 'test.pdf');
+
+    // Expected: 20240411_SS400_9t_中山製鋼所_48D7503
+    assert.strictEqual(result.stem, '20240411_SS400_9t_中山製鋼所_48D7503');
+  });
+
+  it('handles millsheet without all fields', () => {
+    const text = `
+      ミルシート
+      SS400
+      東京製鉄
+    `;
+    const result = suggestMillsheetRename(text, 'test.pdf');
+
+    assert.ok(result.reasons.includes('type: millsheet'));
+    assert.ok(result.stem.includes('SS400'));
+    assert.ok(result.stem.includes('東京製鉄'));
+    assert.ok(result.confidence < 0.95); // Not all fields present
+  });
+});
+
+describe('suggestRename routes to millsheet', () => {
+  it('routes millsheet to suggestMillsheetRename', () => {
+    const text = `
+      ミルシート
+      発行日: 2024/04/11
+      SS400
+      9×1524×3048
+      中山製鋼所
+      製鋼番号: 48D7503
+    `;
+    const result = suggestRename(text, 'test.pdf');
+
+    // Should have millsheet type in reasons
+    assert.ok(result.reasons.includes('type: millsheet'));
+    assert.ok(result.stem.includes('中山製鋼所'));
+  });
+
+  it('does NOT route 見積書 to millsheet', () => {
+    const text = `
+      御見積書
+      令和6年1月30日
+      SS400 t=12
+      株式会社テスト 様
+    `;
+    const result = suggestRename(text, 'test.pdf');
+
+    // Should NOT have millsheet type
+    assert.ok(!result.reasons.includes('type: millsheet'));
+    assert.ok(result.stem.includes('見積書'));
   });
 });
