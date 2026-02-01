@@ -36,7 +36,7 @@ import { computeFileHash } from './vision_ocr.js';
 import { createOcrDocument, extractFullText } from './ocr_schema.js';
 import { suggestRename } from './rename_suggest.js';
 import { runPythonScript } from './python_runner.js';
-import { refineOcrText, refineOcrTextByLines, isLlmEnabled, checkLlmHealth, runTwoModelInference } from './local_llm.js';
+import { refineOcrText, refineOcrTextByLines, isLlmEnabled, checkLlmHealth, runTwoModelInference, runVisionInference } from './local_llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -195,11 +195,17 @@ async function processSingleFile(filePath, args, apiKey) {
     const ocrOutputPath = path.join(args.outputDir, `${basename}.ocr.json`);
     const renameOutputPath = path.join(args.outputDir, `${basename}.rename.json`);
     let ocrDoc;
+    let imagePath = filePath; // Track image path for vision inference
 
     // Check if we should skip OCR
     if (args.skipOcr && await fileExists(ocrOutputPath)) {
       log('info', `  Using existing OCR result: ${basename}.ocr.json`);
       ocrDoc = await readJson(ocrOutputPath);
+      // Try to find existing PNG for vision inference
+      const pngPath = path.join(args.outputDir, `${basename}.png`);
+      if (await fileExists(pngPath)) {
+        imagePath = pngPath;
+      }
     } else {
       // Validate API key for OCR (only required for non-local providers)
       const ocrProvider = process.env.OCR_PROVIDER || 'local';
@@ -208,7 +214,6 @@ async function processSingleFile(filePath, args, apiKey) {
       }
 
       // Convert PDF to PNG if needed
-      let imagePath = filePath;
       if (isPdf(filePath)) {
         log('info', `  Converting PDF to PNG (${args.dpi} DPI)...`);
         imagePath = await pdfToPng(filePath, args.outputDir, args.dpi);
@@ -320,19 +325,21 @@ async function processSingleFile(filePath, args, apiKey) {
     const fullText = extractFullText(ocrDoc);
     let llmExtraction = null;
 
-    // 2モデル推論でリネーム精度向上 (optional)
+    // Vision + 2モデル推論でリネーム精度向上 (optional)
     if (args.llmRename) {
-      log('info', `  Running 2-model inference for rename...`);
+      log('info', `  Running vision inference for rename...`);
       const llmHealthy = await checkLlmHealth();
       if (!llmHealthy) {
         log('warn', `  LLM API not available, falling back to rule-based rename`);
       } else {
-        const inferResult = await runTwoModelInference(fullText);
+        // Use vision inference if image is available, otherwise fallback to text-only
+        const inferResult = await runVisionInference(fullText, imagePath);
         if (inferResult.success && inferResult.data) {
           llmExtraction = inferResult.data;
-          log('info', `  2-model inference: date=${llmExtraction.date || 'null'}, docType=${llmExtraction.docType || 'null'}, company=${llmExtraction.company || 'null'}`);
+          const mode = inferResult.pipeline?.includes('vision:success') ? 'vision' : 'text';
+          log('info', `  ${mode} inference: date=${llmExtraction.date || 'null'}, docType=${llmExtraction.docType || 'null'}, company=${llmExtraction.company || 'null'}`);
         } else {
-          log('warn', `  2-model inference failed: ${inferResult.error}`);
+          log('warn', `  Vision inference failed: ${inferResult.error}`);
         }
       }
     }

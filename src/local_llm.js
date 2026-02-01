@@ -5,6 +5,8 @@
  * Used for OCR text refinement (typo correction, line break cleanup)
  */
 
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import {
   LLM_SYSTEM_PROMPT,
   LLM_USER_PROMPT_TEMPLATE,
@@ -13,7 +15,9 @@ import {
   LLM_RENAME_EXTRACT_SYSTEM_PROMPT,
   LLM_RENAME_EXTRACT_USER_TEMPLATE,
   LLM_RENAME_VALIDATE_SYSTEM_PROMPT,
-  LLM_RENAME_VALIDATE_USER_TEMPLATE
+  LLM_RENAME_VALIDATE_USER_TEMPLATE,
+  LLM_VISION_EXTRACT_SYSTEM_PROMPT,
+  LLM_VISION_EXTRACT_USER_PROMPT
 } from './llm_prompt.js';
 
 // Default settings
@@ -567,6 +571,174 @@ export async function runTwoModelInference(ocrText, options = {}) {
       success: true, // 抽出は成功しているので
       pipeline,
       error: `Validation failed (using extraction result): ${validateResult.error}`
+    };
+  }
+  pipeline.push('validate:success');
+
+  return {
+    data: validateResult.data,
+    success: true,
+    pipeline
+  };
+}
+
+// ========================================
+// Vision-Language モデル推論 (Qwen3-VL)
+// ========================================
+
+/**
+ * Read image file and encode as base64 data URL
+ * @param {string} imagePath - Path to image file
+ * @returns {Promise<string>} - Base64 data URL
+ */
+async function imageToBase64DataUrl(imagePath) {
+  const imageBuffer = await fs.readFile(imagePath);
+  const ext = path.extname(imagePath).toLowerCase();
+
+  let mimeType;
+  switch (ext) {
+    case '.png':
+      mimeType = 'image/png';
+      break;
+    case '.jpg':
+    case '.jpeg':
+      mimeType = 'image/jpeg';
+      break;
+    case '.gif':
+      mimeType = 'image/gif';
+      break;
+    case '.webp':
+      mimeType = 'image/webp';
+      break;
+    default:
+      mimeType = 'image/png';
+  }
+
+  const base64 = imageBuffer.toString('base64');
+  return `data:${mimeType};base64,${base64}`;
+}
+
+/**
+ * Vision Model (Qwen3-VL): 画像から直接情報を抽出
+ *
+ * @param {string} imagePath - 画像ファイルパス
+ * @param {Object} options - オプション
+ * @param {string} options.visionModel - Vision モデル名 (default: qwen3-vl)
+ * @returns {Promise<{data: Object|null, success: boolean, error?: string}>}
+ */
+export async function extractFromImage(imagePath, options = {}) {
+  const apiUrl = options.apiUrl || getLlmApiUrl();
+  const model = options.visionModel || 'qwen3-vl';
+  const timeout = options.timeout || 120000; // Vision is slower, 120s timeout
+
+  try {
+    // Read and encode image
+    const imageDataUrl = await imageToBase64DataUrl(imagePath);
+
+    const requestBody = {
+      model: model,
+      messages: [
+        { role: 'system', content: LLM_VISION_EXTRACT_SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: imageDataUrl }
+            },
+            {
+              type: 'text',
+              text: LLM_VISION_EXTRACT_USER_PROMPT
+            }
+          ]
+        }
+      ],
+      temperature: 0,
+      max_tokens: 1024,
+      stream: false
+    };
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    const response = await fetch(`${apiUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return {
+        data: null,
+        success: false,
+        error: `Vision API error (${response.status}): ${errorText}`
+      };
+    }
+
+    const result = await response.json();
+    const rawOutput = result.choices?.[0]?.message?.content?.trim();
+
+    if (!rawOutput) {
+      return { data: null, success: false, error: 'Vision returned empty response' };
+    }
+
+    const parsed = parseJsonFromLlmOutput(rawOutput);
+    if (!parsed) {
+      return { data: null, success: false, error: `Failed to parse vision JSON: ${rawOutput.substring(0, 200)}` };
+    }
+
+    return { data: parsed, success: true };
+
+  } catch (error) {
+    return {
+      data: null,
+      success: false,
+      error: error.name === 'AbortError' ? 'Vision request timeout' : error.message
+    };
+  }
+}
+
+/**
+ * Vision + Text 2モデル推論パイプライン
+ *
+ * Qwen3-VL (画像から抽出) → Qwen3 (検証)
+ *
+ * @param {string} ocrText - OCRテキスト（検証用）
+ * @param {string} imagePath - 画像ファイルパス
+ * @param {Object} options - オプション
+ * @returns {Promise<{data: Object, success: boolean, pipeline: string[], error?: string}>}
+ */
+export async function runVisionInference(ocrText, imagePath, options = {}) {
+  const pipeline = [];
+
+  // Step 1: Qwen3-VL で画像から直接抽出
+  pipeline.push('vision:start');
+  const visionResult = await extractFromImage(imagePath, options);
+
+  if (!visionResult.success || !visionResult.data) {
+    pipeline.push(`vision:failed:${visionResult.error}`);
+    // Fallback to text-only inference
+    pipeline.push('fallback:text-only');
+    return runTwoModelInference(ocrText, options);
+  }
+  pipeline.push('vision:success');
+
+  // Step 2: Qwen3 で検証（OCRテキストと照合）
+  pipeline.push('validate:start');
+  const validateResult = await validateExtraction(visionResult.data, ocrText, options);
+
+  if (!validateResult.success || !validateResult.data) {
+    // 検証失敗時はVision結果をそのまま使用
+    pipeline.push(`validate:failed:${validateResult.error}`);
+    return {
+      data: visionResult.data,
+      success: true,
+      pipeline,
+      error: `Validation failed (using vision result): ${validateResult.error}`
     };
   }
   pipeline.push('validate:success');
