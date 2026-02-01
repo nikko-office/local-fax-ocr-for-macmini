@@ -703,11 +703,12 @@ export async function extractFromImage(imagePath, options = {}) {
 }
 
 /**
- * Vision + Text 2モデル推論パイプライン
+ * Vision推論パイプライン（1回推論）
  *
- * Qwen3-VL (画像から抽出) → Qwen3 (検証)
+ * Vision成功時: Qwen3-VL のみ（画像を直接見ているので検証不要）
+ * Vision失敗時: テキストのみ2モデル推論にフォールバック
  *
- * @param {string} ocrText - OCRテキスト（検証用）
+ * @param {string} ocrText - OCRテキスト（フォールバック用）
  * @param {string} imagePath - 画像ファイルパス
  * @param {Object} options - オプション
  * @returns {Promise<{data: Object, success: boolean, pipeline: string[], error?: string}>}
@@ -715,36 +716,22 @@ export async function extractFromImage(imagePath, options = {}) {
 export async function runVisionInference(ocrText, imagePath, options = {}) {
   const pipeline = [];
 
-  // Step 1: Qwen3-VL で画像から直接抽出
+  // Qwen3-VL で画像から直接抽出（1回のみ）
   pipeline.push('vision:start');
   const visionResult = await extractFromImage(imagePath, options);
 
   if (!visionResult.success || !visionResult.data) {
     pipeline.push(`vision:failed:${visionResult.error}`);
-    // Fallback to text-only inference
+    // Fallback to text-only 2-model inference
     pipeline.push('fallback:text-only');
     return runTwoModelInference(ocrText, options);
   }
+
+  // Vision成功 - 画像を直接見ているので検証不要
   pipeline.push('vision:success');
 
-  // Step 2: Qwen3 で検証（OCRテキストと照合）
-  pipeline.push('validate:start');
-  const validateResult = await validateExtraction(visionResult.data, ocrText, options);
-
-  if (!validateResult.success || !validateResult.data) {
-    // 検証失敗時はVision結果をそのまま使用
-    pipeline.push(`validate:failed:${validateResult.error}`);
-    return {
-      data: visionResult.data,
-      success: true,
-      pipeline,
-      error: `Validation failed (using vision result): ${validateResult.error}`
-    };
-  }
-  pipeline.push('validate:success');
-
   return {
-    data: validateResult.data,
+    data: visionResult.data,
     success: true,
     pipeline
   };
