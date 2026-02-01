@@ -9,7 +9,11 @@ import {
   LLM_SYSTEM_PROMPT,
   LLM_USER_PROMPT_TEMPLATE,
   LLM_LINES_SYSTEM_PROMPT,
-  LLM_LINES_USER_PROMPT_TEMPLATE
+  LLM_LINES_USER_PROMPT_TEMPLATE,
+  LLM_RENAME_EXTRACT_SYSTEM_PROMPT,
+  LLM_RENAME_EXTRACT_USER_TEMPLATE,
+  LLM_RENAME_VALIDATE_SYSTEM_PROMPT,
+  LLM_RENAME_VALIDATE_USER_TEMPLATE
 } from './llm_prompt.js';
 
 // Default settings
@@ -348,4 +352,228 @@ export async function refineOcrTextByLines(lines, options = {}) {
       error: error.name === 'AbortError' ? 'LLM request timeout' : error.message
     };
   }
+}
+
+// ========================================
+// 2モデル推論: リネーム精度向上
+// ========================================
+
+/**
+ * Parse JSON from LLM output (handles code fences and malformed JSON)
+ * @param {string} text - Raw LLM output
+ * @returns {Object|null} - Parsed JSON or null
+ */
+function parseJsonFromLlmOutput(text) {
+  if (!text || typeof text !== 'string') return null;
+
+  // Remove code fences
+  let cleaned = text;
+  cleaned = cleaned.replace(/^```(?:json)?\n?/gm, '');
+  cleaned = cleaned.replace(/\n?```$/gm, '');
+  cleaned = cleaned.trim();
+
+  // Try to find JSON object in the output
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return null;
+
+  try {
+    return JSON.parse(jsonMatch[0]);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Model A (Gemma3): 構造化データ抽出
+ *
+ * @param {string} ocrText - OCRテキスト
+ * @param {Object} options - オプション
+ * @returns {Promise<{data: Object|null, success: boolean, error?: string}>}
+ */
+export async function extractStructuredData(ocrText, options = {}) {
+  const apiUrl = options.apiUrl || getLlmApiUrl();
+  const model = options.extractModel || 'gemma3';
+  const timeout = options.timeout || DEFAULT_TIMEOUT_MS;
+
+  const userPrompt = LLM_RENAME_EXTRACT_USER_TEMPLATE.replace('{{OCR_TEXT}}', ocrText);
+
+  const requestBody = {
+    model: model,
+    messages: [
+      { role: 'system', content: LLM_RENAME_EXTRACT_SYSTEM_PROMPT },
+      { role: 'user', content: userPrompt }
+    ],
+    temperature: 0,
+    max_tokens: 1024,
+    stream: false
+  };
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    const response = await fetch(`${apiUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return {
+        data: null,
+        success: false,
+        error: `Extract API error (${response.status}): ${errorText}`
+      };
+    }
+
+    const result = await response.json();
+    const rawOutput = result.choices?.[0]?.message?.content?.trim();
+
+    if (!rawOutput) {
+      return { data: null, success: false, error: 'Extract returned empty response' };
+    }
+
+    const parsed = parseJsonFromLlmOutput(rawOutput);
+    if (!parsed) {
+      return { data: null, success: false, error: 'Failed to parse extraction JSON' };
+    }
+
+    return { data: parsed, success: true };
+
+  } catch (error) {
+    return {
+      data: null,
+      success: false,
+      error: error.name === 'AbortError' ? 'Extract request timeout' : error.message
+    };
+  }
+}
+
+/**
+ * Model B (Qwen3): 検証・補正
+ *
+ * @param {Object} extractedData - Model Aの抽出結果
+ * @param {string} ocrText - 元のOCRテキスト
+ * @param {Object} options - オプション
+ * @returns {Promise<{data: Object|null, success: boolean, error?: string}>}
+ */
+export async function validateExtraction(extractedData, ocrText, options = {}) {
+  const apiUrl = options.apiUrl || getLlmApiUrl();
+  const model = options.validateModel || 'qwen3';
+  const timeout = options.timeout || DEFAULT_TIMEOUT_MS;
+
+  const userPrompt = LLM_RENAME_VALIDATE_USER_TEMPLATE
+    .replace('{{EXTRACTED_DATA}}', JSON.stringify(extractedData, null, 2))
+    .replace('{{OCR_TEXT}}', ocrText);
+
+  const requestBody = {
+    model: model,
+    messages: [
+      { role: 'system', content: LLM_RENAME_VALIDATE_SYSTEM_PROMPT },
+      { role: 'user', content: userPrompt }
+    ],
+    temperature: 0,
+    max_tokens: 1024,
+    stream: false
+  };
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    const response = await fetch(`${apiUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return {
+        data: null,
+        success: false,
+        error: `Validate API error (${response.status}): ${errorText}`
+      };
+    }
+
+    const result = await response.json();
+    const rawOutput = result.choices?.[0]?.message?.content?.trim();
+
+    if (!rawOutput) {
+      return { data: null, success: false, error: 'Validate returned empty response' };
+    }
+
+    const parsed = parseJsonFromLlmOutput(rawOutput);
+    if (!parsed) {
+      return { data: null, success: false, error: 'Failed to parse validation JSON' };
+    }
+
+    return { data: parsed, success: true };
+
+  } catch (error) {
+    return {
+      data: null,
+      success: false,
+      error: error.name === 'AbortError' ? 'Validate request timeout' : error.message
+    };
+  }
+}
+
+/**
+ * 2モデル推論パイプライン
+ *
+ * PaddleOCR → Gemma3 (抽出) → Qwen3 (検証)
+ *
+ * @param {string} ocrText - OCRテキスト
+ * @param {Object} options - オプション
+ * @param {string} options.extractModel - 抽出モデル (default: gemma3)
+ * @param {string} options.validateModel - 検証モデル (default: qwen3)
+ * @returns {Promise<{data: Object, success: boolean, pipeline: string[], error?: string}>}
+ */
+export async function runTwoModelInference(ocrText, options = {}) {
+  const pipeline = [];
+
+  // Step 1: Gemma3 で抽出
+  pipeline.push('extract:start');
+  const extractResult = await extractStructuredData(ocrText, options);
+
+  if (!extractResult.success || !extractResult.data) {
+    pipeline.push(`extract:failed:${extractResult.error}`);
+    return {
+      data: { date: null, docType: null, company: null, material: null, confidence: 0 },
+      success: false,
+      pipeline,
+      error: `Extraction failed: ${extractResult.error}`
+    };
+  }
+  pipeline.push('extract:success');
+
+  // Step 2: Qwen3 で検証
+  pipeline.push('validate:start');
+  const validateResult = await validateExtraction(extractResult.data, ocrText, options);
+
+  if (!validateResult.success || !validateResult.data) {
+    // 検証失敗時は抽出結果をそのまま使用
+    pipeline.push(`validate:failed:${validateResult.error}`);
+    return {
+      data: extractResult.data,
+      success: true, // 抽出は成功しているので
+      pipeline,
+      error: `Validation failed (using extraction result): ${validateResult.error}`
+    };
+  }
+  pipeline.push('validate:success');
+
+  return {
+    data: validateResult.data,
+    success: true,
+    pipeline
+  };
 }

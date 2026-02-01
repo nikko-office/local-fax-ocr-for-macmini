@@ -822,9 +822,15 @@ export function suggestMillsheetRename(fullText, originalFilename) {
  * Generate rename suggestion from OCR text
  * @param {string} fullText - Full OCR text
  * @param {string} originalFilename - Original filename (for fallback)
+ * @param {Object|null} llmExtraction - Optional LLM extraction result (2-model inference)
+ * @param {string|null} llmExtraction.date - Date in YYYYMMDD format
+ * @param {string|null} llmExtraction.docType - Document type
+ * @param {string|null} llmExtraction.company - Company name
+ * @param {string|null} llmExtraction.material - Material
+ * @param {number} llmExtraction.confidence - Confidence 0.0-1.0
  * @returns {RenameSuggestion}
  */
-export function suggestRename(fullText, originalFilename) {
+export function suggestRename(fullText, originalFilename, llmExtraction = null) {
   // ミルシート判定
   if (isMillsheet(fullText)) {
     return suggestMillsheetRename(fullText, originalFilename);
@@ -833,43 +839,77 @@ export function suggestRename(fullText, originalFilename) {
   const reasons = [];
   let signalCount = 0;
 
-  // Extract date
-  const dateResult = extractDate(fullText);
+  // LLM抽出結果がある場合は優先使用
+  const useLlm = llmExtraction && llmExtraction.confidence >= 0.5;
+  if (useLlm) {
+    reasons.push(`source: llm-2model (confidence=${llmExtraction.confidence})`);
+  }
+
+  // Extract date (LLM優先)
   let datePart = null;
-  if (dateResult.value) {
-    datePart = dateResult.value;
-    reasons.push(`date: ${dateResult.raw} -> ${dateResult.value}`);
+  if (useLlm && llmExtraction.date) {
+    datePart = llmExtraction.date;
+    reasons.push(`date: llm -> ${llmExtraction.date}`);
     signalCount++;
+  } else {
+    const dateResult = extractDate(fullText);
+    if (dateResult.value) {
+      datePart = dateResult.value;
+      reasons.push(`date: ${dateResult.raw} -> ${dateResult.value}`);
+      signalCount++;
+    }
   }
 
-  // Extract document type
-  const docTypeResult = extractDocType(fullText);
+  // Extract document type (LLM優先)
   let docTypePart = null;
-  if (docTypeResult.value) {
-    docTypePart = docTypeResult.value;
-    reasons.push(`doc_type: ${docTypeResult.raw} -> ${docTypeResult.value}`);
+  if (useLlm && llmExtraction.docType) {
+    docTypePart = llmExtraction.docType;
+    reasons.push(`doc_type: llm -> ${llmExtraction.docType}`);
     signalCount++;
+  } else {
+    const docTypeResult = extractDocType(fullText);
+    if (docTypeResult.value) {
+      docTypePart = docTypeResult.value;
+      reasons.push(`doc_type: ${docTypeResult.raw} -> ${docTypeResult.value}`);
+      signalCount++;
+    }
   }
 
-  // Extract counterpart (excluding self company)
-  const counterpartResult = extractCounterpart(fullText);
+  // Extract counterpart (LLM優先、自社名・社員名除外)
   let counterpartPart = null;
-  if (counterpartResult.value) {
-    counterpartPart = counterpartResult.value;
-    reasons.push(`counterpart: ${counterpartResult.raw} -> ${counterpartResult.value}`);
-    signalCount++;
+  if (useLlm && llmExtraction.company) {
+    // LLM結果も自社名・社員名チェック
+    if (!isSelfCompany(llmExtraction.company) && !isEmployeeName(llmExtraction.company)) {
+      counterpartPart = llmExtraction.company;
+      reasons.push(`counterpart: llm -> ${llmExtraction.company}`);
+      signalCount++;
+    }
+  }
+  if (!counterpartPart) {
+    const counterpartResult = extractCounterpart(fullText);
+    if (counterpartResult.value) {
+      counterpartPart = counterpartResult.value;
+      reasons.push(`counterpart: ${counterpartResult.raw} -> ${counterpartResult.value}`);
+      signalCount++;
+    }
   }
 
-  // Extract materials
-  const materialsResult = extractMaterials(fullText);
+  // Extract materials (LLM優先)
   let materialsPart = null;
-  if (materialsResult.value) {
-    materialsPart = materialsResult.value;
-    reasons.push(`materials: ${materialsResult.raw}`);
+  if (useLlm && llmExtraction.material) {
+    materialsPart = llmExtraction.material;
+    reasons.push(`materials: llm -> ${llmExtraction.material}`);
     signalCount++;
+  } else {
+    const materialsResult = extractMaterials(fullText);
+    if (materialsResult.value) {
+      materialsPart = materialsResult.value;
+      reasons.push(`materials: ${materialsResult.raw}`);
+      signalCount++;
+    }
   }
 
-  // Extract item count or drawing numbers
+  // Extract item count or drawing numbers (ルールベースのみ)
   const itemCountResult = extractItemCount(fullText);
   const drawingResult = extractDrawingNumbers(fullText);
 
@@ -884,7 +924,7 @@ export function suggestRename(fullText, originalFilename) {
     signalCount++;
   }
 
-  // Calculate confidence
+  // Calculate confidence (LLM使用時はブースト)
   let confidence;
   if (signalCount >= 4) {
     confidence = 0.95;
@@ -896,6 +936,11 @@ export function suggestRename(fullText, originalFilename) {
     confidence = 0.4;
   } else {
     confidence = 0.1;
+  }
+
+  // LLM使用時は信頼度を少しブースト
+  if (useLlm && confidence < 0.95) {
+    confidence = Math.min(confidence + 0.1, 0.95);
   }
 
   // Build filename stem

@@ -36,7 +36,7 @@ import { computeFileHash } from './vision_ocr.js';
 import { createOcrDocument, extractFullText } from './ocr_schema.js';
 import { suggestRename } from './rename_suggest.js';
 import { runPythonScript } from './python_runner.js';
-import { refineOcrText, refineOcrTextByLines, isLlmEnabled, checkLlmHealth } from './local_llm.js';
+import { refineOcrText, refineOcrTextByLines, isLlmEnabled, checkLlmHealth, runTwoModelInference } from './local_llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -70,6 +70,7 @@ function parseCliArgs() {
     'searchable-pdf': { type: 'boolean', default: false },
     'font-path': { type: 'string' },
     'skip-ocr': { type: 'boolean', default: false },
+    'llm-rename': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
     version: { type: 'boolean', short: 'v', default: false }
   };
@@ -89,6 +90,7 @@ function parseCliArgs() {
       searchablePdf: values['searchable-pdf'],
       fontPath: values['font-path'],
       skipOcr: values['skip-ocr'],
+      llmRename: values['llm-rename'],
       help: values.help,
       version: values.version
     };
@@ -122,6 +124,7 @@ Options:
   --llm-refine-mode   LLM整形モード: text | lines (default: text)
                         text: raw_textのみ更新（bbox非同期）
                         lines: 各行のtextを更新（bbox同期、searchable-pdf向け）
+  --llm-rename        2モデル推論でリネーム精度向上（Gemma3→Qwen3）
   --searchable-pdf    透明テキスト重畳のPDFを生成
   --font-path <path>  日本語フォントファイルパス（searchable-pdf用）
   -h, --help          ヘルプを表示
@@ -315,7 +318,26 @@ async function processSingleFile(filePath, args, apiKey) {
 
     // Generate rename suggestion
     const fullText = extractFullText(ocrDoc);
-    const renameSuggestion = suggestRename(fullText, path.basename(filePath));
+    let llmExtraction = null;
+
+    // 2モデル推論でリネーム精度向上 (optional)
+    if (args.llmRename) {
+      log('info', `  Running 2-model inference for rename...`);
+      const llmHealthy = await checkLlmHealth();
+      if (!llmHealthy) {
+        log('warn', `  LLM API not available, falling back to rule-based rename`);
+      } else {
+        const inferResult = await runTwoModelInference(fullText);
+        if (inferResult.success && inferResult.data) {
+          llmExtraction = inferResult.data;
+          log('info', `  2-model inference: date=${llmExtraction.date || 'null'}, docType=${llmExtraction.docType || 'null'}, company=${llmExtraction.company || 'null'}`);
+        } else {
+          log('warn', `  2-model inference failed: ${inferResult.error}`);
+        }
+      }
+    }
+
+    const renameSuggestion = suggestRename(fullText, path.basename(filePath), llmExtraction);
 
     // Save rename suggestion
     await writeJson(renameOutputPath, renameSuggestion);
