@@ -53,7 +53,8 @@ async function processFile(filePath, outputDir) {
         '--in', filePath,
         '--out', outputDir,
         '--llm-rename',
-        '--apply-rename'
+        '--apply-rename',
+        '--searchable-pdf'
       ], {
         stdio: ['ignore', 'pipe', 'pipe']
       });
