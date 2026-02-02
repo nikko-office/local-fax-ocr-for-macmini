@@ -42,9 +42,9 @@ async function generateSearchablePdf(ocrJsonPath, pngPath, outputDir) {
   return new Promise((resolve) => {
     const proc = spawn('python3', [
       pythonScript,
-      pngPath,
-      ocrJsonPath,
-      searchablePdfPath
+      '--input-pdf', pngPath,
+      '--ocr-json', ocrJsonPath,
+      '--output-pdf', searchablePdfPath
     ], {
       stdio: ['ignore', 'pipe', 'pipe']
     });
