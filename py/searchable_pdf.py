@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Searchable PDF Generator v5.1
+Searchable PDF Generator v5.2
 
 OCR結果を使って既存PDFに不可視テキストレイヤーを追加。
 行単位で独立したtext objectを配置し、自然なテキスト選択を実現。
@@ -163,7 +163,7 @@ def normalize_pdf(src_doc):
     return normalized
 
 
-def create_searchable_pdf(input_file, ocr_doc, output_pdf):
+def create_searchable_pdf(input_file, ocr_doc, output_pdf, dpi=300):
     """行単位で独立したtext objectを持つSearchable PDFを生成"""
 
     summary = {
@@ -190,11 +190,10 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
             img_width, img_height = pix.width, pix.height
             pix = None
 
-            # 新規PDFを作成（A4に近いサイズで）
+            # 新規PDFを作成（DPIに基づくページサイズ）
             src_doc = fitz.open()
-            # FAX画像は通常200dpi、ページサイズを計算
-            page_width = img_width * 72 / 200
-            page_height = img_height * 72 / 200
+            page_width = img_width * 72 / dpi
+            page_height = img_height * 72 / dpi
             pdf_page = src_doc.new_page(width=page_width, height=page_height)
 
             # 画像をストリームとして挿入（元の圧縮を維持）
@@ -228,9 +227,12 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
             ocr_width = ocr_page.get('width', 1)
             ocr_height = ocr_page.get('height', 1)
 
-            # OCR座標→PDF座標のスケール（正立化済みなので単純な比率）
-            scale_x = pdf_width / ocr_width
-            scale_y = pdf_height / ocr_height
+            # DPIを考慮した正確な座標変換
+            # OCR画像の物理サイズ（インチ単位）→ PDF座標（ポイント: 1inch = 72pt）
+            ocr_width_pt = ocr_width / dpi * 72
+            ocr_height_pt = ocr_height / dpi * 72
+            scale_x = pdf_width / ocr_width_pt
+            scale_y = pdf_height / ocr_height_pt
 
             # 全トークンを収集（複数フォーマット対応）
             all_tokens = []
@@ -277,7 +279,7 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
 
                 # 行のフォントサイズを統一
                 line_height_pdf = line_info['line_height'] * scale_y
-                font_size = max(4, min(line_height_pdf * 0.75, 36))
+                font_size = max(4, line_height_pdf * 0.75)
 
                 # 行内のテキストを結合
                 line_text_parts = []
@@ -295,7 +297,9 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
                     if prev_x1 is not None:
                         gap = x0 - prev_x1
                         if gap > font_size * 0.5:
-                            num_spaces = max(1, int(gap / (font_size * 0.4)))
+                            # 日本語フォントの半角スペース幅は約0.25em、英語は約0.3-0.4em
+                            space_width = font_size * 0.3
+                            num_spaces = max(1, int(gap / space_width))
                             line_text_parts.append(' ' * num_spaces)
 
                     line_text_parts.append(text)
@@ -316,10 +320,18 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
                 # 行の開始位置（OCR座標→PDF座標、正立化済みなので単純スケール）
                 first_bbox = tokens[0].get('bbox', {})
                 pdf_x = first_bbox.get('x0', 0) * scale_x
-                # insert_text の y はベースライン扱いになりやすいので、
-                # 下端(y1)にそのまま置くと選択矩形が暴れやすい。
-                # 行高の2割だけ上げて、ベースラインをそれっぽく寄せる。
-                pdf_y = (line_info['y1'] * scale_y) - (line_height_pdf * 0.2)
+                # PyMuPDFのinsert_text()はy座標をベースラインとして解釈する
+                # 日本語フォントの場合、ベースラインは行高の約75%の位置
+                pdf_y = (line_info['y0'] * scale_y) + (line_height_pdf * 0.75)
+
+                # 座標範囲チェック
+                if pdf_x < 0 or pdf_x > pdf_width or pdf_y < 0 or pdf_y > pdf_height:
+                    summary['failures'].append({
+                        'page': page_idx,
+                        'reason': 'out_of_bounds',
+                        'detail': f'Text position ({pdf_x:.1f}, {pdf_y:.1f}) outside page ({pdf_width:.1f} x {pdf_height:.1f})'
+                    })
+                    continue
 
                 # 各行ごとに独立したinsert_text呼び出し
                 # これにより各行が独立したtext objectになる
@@ -372,6 +384,7 @@ def main():
     parser.add_argument('--input-pdf', required=True, help='Input PDF')
     parser.add_argument('--ocr-json', required=True, help='OCR JSON')
     parser.add_argument('--output-pdf', required=True, help='Output PDF')
+    parser.add_argument('--dpi', type=int, default=300, help='OCR DPI (default: 300)')
 
     args = parser.parse_args()
 
@@ -390,7 +403,7 @@ def main():
         sys.exit(1)
 
     try:
-        summary = create_searchable_pdf(args.input_pdf, ocr_doc, args.output_pdf)
+        summary = create_searchable_pdf(args.input_pdf, ocr_doc, args.output_pdf, dpi=args.dpi)
         print(f"Created: {args.output_pdf}")
         print(f"  Pages: {summary['success_pages']}/{summary['total_pages']}")
         print(f"  Lines: {summary['total_lines']}")
