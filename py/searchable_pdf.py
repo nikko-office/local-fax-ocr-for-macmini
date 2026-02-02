@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Searchable PDF Generator v5
+Searchable PDF Generator v5.1
 
 OCR結果を使って既存PDFに不可視テキストレイヤーを追加。
 行単位で独立したtext objectを配置し、自然なテキスト選択を実現。
@@ -27,6 +27,7 @@ import json
 import sys
 from pathlib import Path
 from collections import defaultdict
+from statistics import median
 
 try:
     import fitz  # PyMuPDF
@@ -58,6 +59,8 @@ def load_ocr_document(json_path):
         return json.load(f)
 
 
+
+
 def transform_bbox_for_rotation(bbox, page_width, page_height, rotation):
     x0, y0, x1, y1 = bbox['x0'], bbox['y0'], bbox['x1'], bbox['y1']
     if rotation == 0:
@@ -71,10 +74,34 @@ def transform_bbox_for_rotation(bbox, page_width, page_height, rotation):
     return bbox
 
 
-def cluster_tokens_into_lines(tokens, y_tolerance=15):
+def _estimate_y_tolerance(tokens, default=15):
+    """
+    固定15pxはDPI/スケールで簡単に崩れる。
+    トークン高さの中央値を基準に tolerence を決める。
+    """
+    hs = []
+    for t in tokens:
+        b = t.get("bbox") or {}
+        y0 = b.get("y0")
+        y1 = b.get("y1")
+        if y0 is None or y1 is None:
+            continue
+        h = max(0, float(y1) - float(y0))
+        if h > 0:
+            hs.append(h)
+    if not hs:
+        return default
+    mh = median(hs)
+    # 行の中心が少しズレても同一行として束ねられる程度
+    return max(6, min(int(mh * 0.8), 60))
+
+
+def cluster_tokens_into_lines(tokens, y_tolerance=None):
     """トークンを行単位にクラスタリング"""
     if not tokens:
         return []
+    if y_tolerance is None:
+        y_tolerance = _estimate_y_tolerance(tokens)
 
     lines_dict = defaultdict(list)
     for token in tokens:
@@ -102,6 +129,38 @@ def cluster_tokens_into_lines(tokens, y_tolerance=15):
         })
 
     return lines
+
+
+def normalize_pdf(src_doc):
+    """PDFを正立化（Rotate=0）して新しいドキュメントを返す
+
+    回転がある場合、表示サイズでページを作成し、コンテンツをそのまま貼り込む。
+    show_pdf_pageは自動的に/Rotate属性を適用するので、rotateパラメータは不要。
+    """
+    normalized = fitz.open()
+
+    for page_num in range(len(src_doc)):
+        src_page = src_doc[page_num]
+        rotation = src_page.rotation
+
+        # 表示サイズを計算（/Rotate適用後のサイズ）
+        # MediaBoxは物理サイズ、Rotateで回転して表示される
+        if rotation in [90, 270]:
+            # 90/270度回転の場合、幅と高さが入れ替わる
+            display_width = src_page.rect.height
+            display_height = src_page.rect.width
+        else:
+            display_width = src_page.rect.width
+            display_height = src_page.rect.height
+
+        # 正立化した新ページを作成（表示サイズで）
+        new_page = normalized.new_page(width=display_width, height=display_height)
+
+        # show_pdf_pageは/Rotate属性を自動的に適用してくれる
+        # rotateパラメータは追加の回転なので指定しない
+        new_page.show_pdf_page(new_page.rect, src_doc, page_num)
+
+    return normalized
 
 
 def create_searchable_pdf(input_file, ocr_doc, output_pdf):
@@ -132,19 +191,23 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
             pix = None
 
             # 新規PDFを作成（A4に近いサイズで）
-            doc = fitz.open()
+            src_doc = fitz.open()
             # FAX画像は通常200dpi、ページサイズを計算
             page_width = img_width * 72 / 200
             page_height = img_height * 72 / 200
-            pdf_page = doc.new_page(width=page_width, height=page_height)
+            pdf_page = src_doc.new_page(width=page_width, height=page_height)
 
             # 画像をストリームとして挿入（元の圧縮を維持）
             pdf_page.insert_image(
                 pdf_page.rect,
                 stream=img_data,
             )
+            doc = src_doc  # 画像入力は既に正立
         else:
-            doc = fitz.open(input_file)
+            src_doc = fitz.open(input_file)
+            # PDFを正立化（Rotate=0にして座標系を単純化）
+            doc = normalize_pdf(src_doc)
+            src_doc.close()
     except Exception as e:
         raise SearchablePdfError(f"Failed to open file: {e}")
 
@@ -158,22 +221,21 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
 
         try:
             page = doc[page_idx]
-            page_rect = page.rect
-            rotation = page.rotation
+            # 正立化済みなので rotation=0, 座標系は単純
+            pdf_width = page.rect.width
+            pdf_height = page.rect.height
 
             ocr_width = ocr_page.get('width', 1)
             ocr_height = ocr_page.get('height', 1)
 
-            if rotation in [90, 270]:
-                scale_x = page_rect.width / ocr_height
-                scale_y = page_rect.height / ocr_width
-            else:
-                scale_x = page_rect.width / ocr_width
-                scale_y = page_rect.height / ocr_height
+            # OCR座標→PDF座標のスケール（正立化済みなので単純な比率）
+            scale_x = pdf_width / ocr_width
+            scale_y = pdf_height / ocr_height
 
-            # 全トークンを収集
+            # 全トークンを収集（複数フォーマット対応）
             all_tokens = []
             for block in ocr_page.get('blocks', []):
+                # フォーマット1: blocks/lines/tokens（正規化済み）
                 for line in block.get('lines', []):
                     tokens = line.get('tokens', [])
                     if tokens:
@@ -184,8 +246,29 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
                             'bbox': line.get('bbox', {})
                         })
 
+                # フォーマット2: blocks/paragraphs/words（Google Vision形式）
+                for para in block.get('paragraphs', []):
+                    for word in para.get('words', []):
+                        # symbolsからテキストを結合
+                        text = ''.join(s.get('text', '') for s in word.get('symbols', []))
+                        if not text.strip():
+                            continue
+
+                        # boundingBox.vertices から bbox を抽出
+                        vertices = word.get('boundingBox', {}).get('vertices', [])
+                        if len(vertices) >= 4:
+                            xs = [v.get('x', 0) for v in vertices]
+                            ys = [v.get('y', 0) for v in vertices]
+                            bbox = {
+                                'x0': min(xs),
+                                'y0': min(ys),
+                                'x1': max(xs),
+                                'y1': max(ys)
+                            }
+                            all_tokens.append({'text': text, 'bbox': bbox})
+
             # 行クラスタリング
-            lines = cluster_tokens_into_lines(all_tokens)
+            lines = cluster_tokens_into_lines(all_tokens, y_tolerance=None)
 
             for line_info in lines:
                 tokens = line_info['tokens']
@@ -206,9 +289,6 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
                         continue
 
                     bbox = token.get('bbox', {})
-                    if rotation != 0:
-                        bbox = transform_bbox_for_rotation(bbox, ocr_width, ocr_height, rotation)
-
                     x0 = bbox.get('x0', 0) * scale_x
 
                     # トークン間のギャップ
@@ -233,19 +313,19 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
                 if not line_text.strip():
                     continue
 
-                # 行の開始位置
+                # 行の開始位置（OCR座標→PDF座標、正立化済みなので単純スケール）
                 first_bbox = tokens[0].get('bbox', {})
-                if rotation != 0:
-                    first_bbox = transform_bbox_for_rotation(first_bbox, ocr_width, ocr_height, rotation)
-
-                start_x = first_bbox.get('x0', 0) * scale_x
-                start_y = line_info['y1'] * scale_y
+                pdf_x = first_bbox.get('x0', 0) * scale_x
+                # insert_text の y はベースライン扱いになりやすいので、
+                # 下端(y1)にそのまま置くと選択矩形が暴れやすい。
+                # 行高の2割だけ上げて、ベースラインをそれっぽく寄せる。
+                pdf_y = (line_info['y1'] * scale_y) - (line_height_pdf * 0.2)
 
                 # 各行ごとに独立したinsert_text呼び出し
                 # これにより各行が独立したtext objectになる
                 try:
                     page.insert_text(
-                        fitz.Point(start_x, start_y),
+                        fitz.Point(pdf_x, pdf_y),
                         line_text,
                         fontsize=font_size,
                         fontname=fontname,
@@ -254,8 +334,13 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
                     )
                     summary['total_chars'] += len(line_text)
                     summary['total_lines'] += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    # サイレントに落とすと原因追えないので記録する
+                    summary['failures'].append({
+                        'page': page_idx,
+                        'reason': 'insert_text',
+                        'detail': str(e)[:200]
+                    })
 
             summary['success_pages'] += 1
 
@@ -264,6 +349,7 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf):
             page_errors.append(error_info)
             summary['failures'].append(error_info)
 
+    # ページ処理自体が落ちたら失敗
     if page_errors:
         doc.close()
         raise SearchablePdfError(
