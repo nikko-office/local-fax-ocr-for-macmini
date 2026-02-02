@@ -121,6 +121,25 @@ suggested_name=$(cat "{出力フォルダ}/{ベース名}.rename.json" | jq -r '
 mv "{入力ファイル}" "{入力フォルダ}/${suggested_name}.pdf"
 ```
 
+### Watchモード（リアルタイム監視）
+
+フォルダを監視し、新規/変更ファイルを即座に処理する。
+バッチ処理と異なり、処理中にファイルが追加されても検出可能。
+
+```bash
+# FAX1NEWフォルダを監視（起動時に既存ファイルもスキャン）
+node src/watch.js "/path/to/FAX1NEW" ./output/watch
+
+# 既存ファイルをスキップして監視のみ
+node src/watch.js "/path/to/FAX1NEW" --no-scan
+```
+
+**Watchモードの特徴:**
+- 新規PDFファイルを即座に検出・処理
+- `YYYYMMDD_`で始まるファイルは自動スキップ
+- ファイル書き込み完了まで2秒待機（部分ファイル防止）
+- Ctrl+C で終了
+
 ---
 
 ## ファイル名フォーマット
