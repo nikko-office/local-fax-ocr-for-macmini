@@ -30,7 +30,8 @@ class OCREngine:
         self,
         lang: str = "japan",
         use_gpu: bool = False,
-        enable_mkldnn: bool = False
+        enable_mkldnn: bool = False,
+        use_angle_cls: bool = False
     ):
         """
         Initialize OCR engine
@@ -39,12 +40,13 @@ class OCREngine:
             lang: Language setting ("japan" for Japanese)
             use_gpu: GPU usage flag
             enable_mkldnn: MKL-DNN optimization (for Intel CPUs)
+            use_angle_cls: Rotation detection (False=座標ズレ防止)
         """
         self.ocr = PaddleOCR(
             lang=lang,
             use_gpu=use_gpu,
             enable_mkldnn=enable_mkldnn,
-            use_angle_cls=True,  # Rotation detection
+            use_angle_cls=use_angle_cls,
             show_log=False
         )
 

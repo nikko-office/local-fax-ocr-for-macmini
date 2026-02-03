@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     ocr_lang: str = "japan"
     ocr_use_gpu: bool = False
     ocr_enable_mkldnn: bool = False
+    ocr_use_angle_cls: bool = False  # 自動回転検出を無効化（座標ズレ防止）
 
     # Preprocessing settings
     preprocess_scale_factor: float = 2.0

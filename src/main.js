@@ -36,7 +36,7 @@ import { computeFileHash } from './vision_ocr.js';
 import { createOcrDocument, extractFullText } from './ocr_schema.js';
 import { suggestRename } from './rename_suggest.js';
 import { runPythonScript } from './python_runner.js';
-import { refineOcrText, refineOcrTextByLines, isLlmEnabled, checkLlmHealth, runTwoModelInference, runVisionInference } from './local_llm.js';
+import { refineOcrText, refineOcrTextByLines, isLlmEnabled, checkLlmHealth, runTwoModelInference, runVisionInference, correctOcrWithVision, applyOcrCorrections } from './local_llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,6 +71,9 @@ function parseCliArgs() {
     'font-path': { type: 'string' },
     'skip-ocr': { type: 'boolean', default: false },
     'llm-rename': { type: 'boolean', default: false },
+    'ocr-correct': { type: 'boolean', default: false },
+    rotate: { type: 'string', default: '0' },
+    'auto-rotate': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
     version: { type: 'boolean', short: 'v', default: false }
   };
@@ -91,6 +94,9 @@ function parseCliArgs() {
       fontPath: values['font-path'],
       skipOcr: values['skip-ocr'],
       llmRename: values['llm-rename'],
+      ocrCorrect: values['ocr-correct'],
+      rotate: parseInt(values.rotate, 10),
+      autoRotate: values['auto-rotate'],
       help: values.help,
       version: values.version
     };
@@ -125,8 +131,11 @@ Options:
                         text: raw_textのみ更新（bbox非同期）
                         lines: 各行のtextを更新（bbox同期、searchable-pdf向け）
   --llm-rename        2モデル推論でリネーム精度向上（Gemma3→Qwen3）
+  --ocr-correct       Vision-Grounded OCR補正（画像を見てOCRテキストを修正）
   --searchable-pdf    透明テキスト重畳のPDFを生成
   --font-path <path>  日本語フォントファイルパス（searchable-pdf用）
+  --rotate <degrees>  PDF回転角度（0, 90, 180, 270）時計回り (default: 0)
+  --auto-rotate       横長PDFを自動検出して90°回転（FAX文書向け）
   -h, --help          ヘルプを表示
   -v, --version       バージョンを表示
 
@@ -197,6 +206,113 @@ async function processSingleFile(filePath, args, apiKey) {
     let ocrDoc;
     let imagePath = filePath; // Track image path for vision inference
 
+    // ========================================
+    // STEP 1: PDF正規化（回転がある場合）
+    // ========================================
+    let pdfToProcess = filePath;
+    let tempNormalizedPdf = null;
+
+    if (isPdf(filePath)) {
+      try {
+        // Check if PDF needs normalization using inline Python
+        const { spawn } = await import('child_process');
+        const checkScript = `
+import fitz
+import sys
+doc = fitz.open(sys.argv[1])
+needs = any(p.rotation != 0 for p in doc)
+print("NEEDS_NORMALIZATION" if needs else "OK")
+doc.close()
+`;
+        const checkResult = await new Promise((resolve, reject) => {
+          const proc = spawn('python3', ['-c', checkScript, filePath]);
+          let output = '';
+          let error = '';
+          proc.stdout.on('data', (data) => { output += data.toString(); });
+          proc.stderr.on('data', (data) => { error += data.toString(); });
+          proc.on('close', (code) => {
+            if (code === 0) resolve(output.trim());
+            else reject(new Error(error || `Exit code ${code}`));
+          });
+        });
+
+        if (checkResult.includes('NEEDS_NORMALIZATION')) {
+          log('info', `  PDF has rotation, normalizing first...`);
+          tempNormalizedPdf = path.join(args.outputDir, `_temp_normalized_${Date.now()}.pdf`);
+
+          await runPythonScript('normalize_pdf.py', [
+            '--input-pdf', filePath,
+            '--output-pdf', tempNormalizedPdf
+          ]);
+
+          pdfToProcess = tempNormalizedPdf;
+          log('info', `  PDF normalized to 0° rotation`);
+        }
+      } catch (e) {
+        // If normalization check fails, continue with original file
+        log('warn', `  PDF normalization check failed: ${e.message}`);
+      }
+
+      // ========================================
+      // STEP 1.5: 回転処理（手動 or 自動）
+      // ========================================
+      let rotationToApply = 0;
+
+      if (args.rotate && args.rotate !== 0) {
+        // 手動指定を優先
+        rotationToApply = args.rotate;
+        log('info', `  Manual rotation specified: ${rotationToApply}°`);
+      } else if (args.autoRotate) {
+        // 自動回転検出
+        try {
+          log('info', `  Auto-detecting rotation...`);
+          const detectResult = await runPythonScript('smart_auto_rotate.py', [
+            '--input-pdf', pdfToProcess
+          ]);
+          const detection = JSON.parse(detectResult.stdout);
+
+          if (detection.needs_rotation) {
+            rotationToApply = detection.rotation;
+            log('info', `  Auto-detected: ${rotationToApply}° (${detection.reason})`);
+          } else {
+            log('info', `  No rotation needed (${detection.reason})`);
+          }
+        } catch (e) {
+          log('warn', `  Auto-rotation detection failed: ${e.message}`);
+        }
+      }
+
+      // 回転を適用
+      if (rotationToApply && rotationToApply !== 0) {
+        const validRotations = [90, 180, 270];
+        if (!validRotations.includes(rotationToApply)) {
+          log('warn', `  Invalid rotation: ${rotationToApply}. Must be 0, 90, 180, or 270.`);
+        } else {
+          log('info', `  Rotating PDF ${rotationToApply}° clockwise...`);
+          const tempRotatedPdf = path.join(args.outputDir, `_temp_rotated_${Date.now()}.pdf`);
+
+          await runPythonScript('rotate_pdf.py', [
+            '--input-pdf', pdfToProcess,
+            '--output-pdf', tempRotatedPdf,
+            '--degrees', String(rotationToApply)
+          ]);
+
+          // Clean up previous temp file if it was created
+          if (tempNormalizedPdf && tempNormalizedPdf !== pdfToProcess) {
+            try {
+              await fs.unlink(tempNormalizedPdf);
+            } catch (e) {
+              // Ignore cleanup errors
+            }
+          }
+
+          pdfToProcess = tempRotatedPdf;
+          tempNormalizedPdf = tempRotatedPdf; // Track for cleanup
+          log('info', `  PDF rotated ${rotationToApply}°`);
+        }
+      }
+    }
+
     // Check if we should skip OCR
     if (args.skipOcr && await fileExists(ocrOutputPath)) {
       log('info', `  Using existing OCR result: ${basename}.ocr.json`);
@@ -213,10 +329,11 @@ async function processSingleFile(filePath, args, apiKey) {
         throw new Error('GOOGLE_CLOUD_API_KEY is required (set OCR_PROVIDER=local for offline mode)');
       }
 
-      // Convert PDF to PNG if needed
+      // Convert PDF to PNG if needed (use normalized PDF)
       if (isPdf(filePath)) {
         log('info', `  Converting PDF to PNG (${args.dpi} DPI)...`);
-        imagePath = await pdfToPng(filePath, args.outputDir, args.dpi);
+        // Use original basename to avoid temp file naming issues
+        imagePath = await pdfToPng(pdfToProcess, args.outputDir, args.dpi, basename);
       }
 
       // Compute hash for caching
@@ -321,6 +438,47 @@ async function processSingleFile(filePath, args, apiKey) {
       }
     }
 
+    // Vision-Grounded OCR Correction (optional)
+    if (args.ocrCorrect) {
+      log('info', `  Running Vision-Grounded OCR correction...`);
+      const llmHealthy = await checkLlmHealth();
+      if (!llmHealthy) {
+        log('warn', `  LLM API not available, skipping OCR correction`);
+      } else {
+        // Prepare OCR items from document
+        const ocrItems = [];
+        for (const page of ocrDoc.pages) {
+          for (const block of page.blocks) {
+            for (const line of block.lines) {
+              ocrItems.push({
+                bbox: line.bbox,
+                text: line.text,
+                confidence: line.confidence
+              });
+            }
+          }
+        }
+
+        if (ocrItems.length === 0) {
+          log('warn', `  No OCR items found for correction`);
+        } else {
+          const correctionResult = await correctOcrWithVision(ocrItems, imagePath);
+          if (correctionResult.success && correctionResult.data) {
+            // Apply corrections
+            ocrDoc = applyOcrCorrections(ocrDoc, correctionResult.data);
+            await writeJson(ocrOutputPath, ocrDoc);
+
+            const summary = correctionResult.data.summary || {};
+            log('info', `  OCR correction: ${summary.corrected || 0} corrected, ${summary.unchanged || 0} unchanged`);
+            result.ocr_corrected = true;
+          } else {
+            log('warn', `  OCR correction failed: ${correctionResult.error}`);
+            result.ocr_corrected = false;
+          }
+        }
+      }
+    }
+
     // Generate rename suggestion
     const fullText = extractFullText(ocrDoc);
     let llmExtraction = null;
@@ -384,16 +542,13 @@ async function processSingleFile(filePath, args, apiKey) {
         log('info', `  Generating searchable PDF...`);
         const searchablePdfPath = path.join(args.outputDir, `${basename}.searchable.pdf`);
 
+        // Use normalized PDF (pdfToProcess) - OCR座標と一致する
         const pythonArgs = [
-          '--input-pdf', filePath,
+          '--input-pdf', pdfToProcess,
           '--ocr-json', ocrOutputPath,
-          '--dpi', String(args.dpi),
-          '--output-pdf', searchablePdfPath
+          '--output-pdf', searchablePdfPath,
+          '--dpi', String(args.dpi)
         ];
-
-        if (args.fontPath) {
-          pythonArgs.push('--font-path', args.fontPath);
-        }
 
         try {
           await runPythonScript('searchable_pdf.py', pythonArgs);
@@ -409,6 +564,15 @@ async function processSingleFile(filePath, args, apiKey) {
     if (args.applyRename && renameSuggestion.confidence >= 0.5) {
       const newPath = await applyRename(filePath, renameSuggestion.stem);
       log('info', `  Renamed: ${path.basename(filePath)} -> ${path.basename(newPath)}`);
+    }
+
+    // Cleanup temporary normalized PDF
+    if (tempNormalizedPdf) {
+      try {
+        await fs.unlink(tempNormalizedPdf);
+      } catch (e) {
+        // Ignore cleanup errors
+      }
     }
 
     return result;

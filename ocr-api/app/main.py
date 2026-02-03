@@ -35,7 +35,8 @@ async def lifespan(app: FastAPI):
     ocr_engine = OCREngine(
         lang=settings.ocr_lang,
         use_gpu=settings.ocr_use_gpu,
-        enable_mkldnn=settings.ocr_enable_mkldnn
+        enable_mkldnn=settings.ocr_enable_mkldnn,
+        use_angle_cls=settings.ocr_use_angle_cls
     )
     preprocessor = ImagePreprocessor(
         scale_factor=settings.preprocess_scale_factor,

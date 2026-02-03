@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Searchable PDF Generator v5.2
+Searchable PDF Generator v5.3
 
 OCR結果を使って既存PDFに不可視テキストレイヤーを追加。
 行単位で独立したtext objectを配置し、自然なテキスト選択を実現。
@@ -61,17 +61,6 @@ def load_ocr_document(json_path):
 
 
 
-def transform_bbox_for_rotation(bbox, page_width, page_height, rotation):
-    x0, y0, x1, y1 = bbox['x0'], bbox['y0'], bbox['x1'], bbox['y1']
-    if rotation == 0:
-        return bbox
-    elif rotation == 90:
-        return {'x0': page_height - y1, 'y0': x0, 'x1': page_height - y0, 'y1': x1}
-    elif rotation == 180:
-        return {'x0': page_width - x1, 'y0': page_height - y1, 'x1': page_width - x0, 'y1': page_height - y0}
-    elif rotation == 270:
-        return {'x0': y0, 'y0': page_width - x1, 'x1': y1, 'y1': page_width - x0}
-    return bbox
 
 
 def _estimate_y_tolerance(tokens, default=15):
@@ -131,36 +120,6 @@ def cluster_tokens_into_lines(tokens, y_tolerance=None):
     return lines
 
 
-def normalize_pdf(src_doc):
-    """PDFを正立化（Rotate=0）して新しいドキュメントを返す
-
-    回転がある場合、表示サイズでページを作成し、コンテンツをそのまま貼り込む。
-    show_pdf_pageは自動的に/Rotate属性を適用するので、rotateパラメータは不要。
-    """
-    normalized = fitz.open()
-
-    for page_num in range(len(src_doc)):
-        src_page = src_doc[page_num]
-        rotation = src_page.rotation
-
-        # 表示サイズを計算（/Rotate適用後のサイズ）
-        # MediaBoxは物理サイズ、Rotateで回転して表示される
-        if rotation in [90, 270]:
-            # 90/270度回転の場合、幅と高さが入れ替わる
-            display_width = src_page.rect.height
-            display_height = src_page.rect.width
-        else:
-            display_width = src_page.rect.width
-            display_height = src_page.rect.height
-
-        # 正立化した新ページを作成（表示サイズで）
-        new_page = normalized.new_page(width=display_width, height=display_height)
-
-        # show_pdf_pageは/Rotate属性を自動的に適用してくれる
-        # rotateパラメータは追加の回転なので指定しない
-        new_page.show_pdf_page(new_page.rect, src_doc, page_num)
-
-    return normalized
 
 
 def create_searchable_pdf(input_file, ocr_doc, output_pdf, dpi=300):
@@ -203,10 +162,9 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf, dpi=300):
             )
             doc = src_doc  # 画像入力は既に正立
         else:
-            src_doc = fitz.open(input_file)
-            # PDFを正立化（Rotate=0にして座標系を単純化）
-            doc = normalize_pdf(src_doc)
-            src_doc.close()
+            # 入力PDFは既にmain.jsで正規化済み（rotation=0）
+            # そのまま使用する
+            doc = fitz.open(input_file)
     except Exception as e:
         raise SearchablePdfError(f"Failed to open file: {e}")
 
@@ -220,19 +178,19 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf, dpi=300):
 
         try:
             page = doc[page_idx]
-            # 正立化済みなので rotation=0, 座標系は単純
+            # 入力PDFは既に正規化済み（rotation=0）であることを期待
+            # main.jsが事前にnormalize_pdf.pyで正規化している
             pdf_width = page.rect.width
             pdf_height = page.rect.height
 
             ocr_width = ocr_page.get('width', 1)
             ocr_height = ocr_page.get('height', 1)
 
-            # DPIを考慮した正確な座標変換
-            # OCR画像の物理サイズ（インチ単位）→ PDF座標（ポイント: 1inch = 72pt）
-            ocr_width_pt = ocr_width / dpi * 72
-            ocr_height_pt = ocr_height / dpi * 72
-            scale_x = pdf_width / ocr_width_pt
-            scale_y = pdf_height / ocr_height_pt
+            # 単純な比率でスケール計算
+            # OCR座標（ピクセル）→ PDF座標（ポイント）への直接マッピング
+            # PaddleOCRの前処理スケール（2x）も含めた実際の座標値を使用
+            scale_x = pdf_width / ocr_width
+            scale_y = pdf_height / ocr_height
 
             # 全トークンを収集（複数フォーマット対応）
             all_tokens = []
@@ -268,6 +226,9 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf, dpi=300):
                                 'y1': max(ys)
                             }
                             all_tokens.append({'text': text, 'bbox': bbox})
+
+            # 座標変換は不要（main.jsが事前にPDFを正規化しているため、
+            # OCR座標とPDFは同じ座標系になっている）
 
             # 行クラスタリング
             lines = cluster_tokens_into_lines(all_tokens, y_tolerance=None)
@@ -343,6 +304,7 @@ def create_searchable_pdf(input_file, ocr_doc, output_pdf, dpi=300):
                         fontname=fontname,
                         fontfile=font_path,
                         render_mode=3,  # 不可視
+                        rotate=0,  # 横書き（明示的に指定）
                     )
                     summary['total_chars'] += len(line_text)
                     summary['total_lines'] += 1
