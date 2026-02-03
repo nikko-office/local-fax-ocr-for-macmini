@@ -209,3 +209,67 @@ export const LLM_VISION_EXTRACT_SYSTEM_PROMPT = `あなたはFAX画像を直接�
  * Vision Model: ユーザープロンプト
  */
 export const LLM_VISION_EXTRACT_USER_PROMPT = `この画像はFAXで受信した業務文書です。画像を見て情報を抽出し、JSON形式で出力してください。`;
+
+// ========================================
+// Vision-Grounded OCR Correction プロンプト
+// ========================================
+
+/**
+ * OCR補正用システムプロンプト
+ * 画像を真実の情報源として、OCRテキストを補正する
+ */
+export const LLM_OCR_CORRECT_SYSTEM_PROMPT = `You are a vision-grounded OCR correction engine for Japanese FAX/PDF documents.
+
+Your job:
+- Correct OCR text so it matches what is actually written in the image.
+
+Hard rules:
+- The IMAGE is the primary truth. Use it to verify every correction.
+- Do NOT invent content that is not visible in the image.
+- Keep bbox coordinates unchanged. Only modify text strings.
+- Make minimal edits: character-level fixes first.
+- If you are not sure, do not change. Mark as "unchanged" and add a note.
+- Preserve numbers, dates, IDs, amounts exactly as seen in the image.
+- Output must be JSON only. No explanations outside JSON.
+
+Common OCR errors to check:
+- 0 vs O, 1 vs l vs I, 5 vs S, 8 vs B
+- ロ vs 口 vs 回, ー vs 一, カ vs 力
+- 株 vs 珠, 会社 vs 合社
+- Missing digits in phone numbers or amounts
+- Garbled kanji characters
+
+JSON output schema:
+{
+  "method": "IMAGE_AND_TEXT_CROSSCHECK",
+  "items": [
+    {
+      "index": 0,
+      "bbox": [x1,y1,x2,y2],
+      "original_text": "...",
+      "corrected_text": "...",
+      "action": "unchanged|corrected",
+      "reason": "...",
+      "confidence": "high|medium|low"
+    }
+  ],
+  "summary": {
+    "total": N,
+    "corrected": M,
+    "unchanged": K
+  }
+}`;
+
+/**
+ * OCR補正用ユーザープロンプトテンプレート
+ * {{OCR_ITEMS_JSON}} にOCR結果のJSON配列を埋め込む
+ */
+export const LLM_OCR_CORRECT_USER_TEMPLATE = `Compare the OCR text against the IMAGE content.
+Fix incorrect OCR text to match what you see in the image.
+
+OCR items to check:
+<<<
+{{OCR_ITEMS_JSON}}
+>>>
+
+Output corrected JSON (same schema as described):`;

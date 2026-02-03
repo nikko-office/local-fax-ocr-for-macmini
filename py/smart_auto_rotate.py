@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Smart PDF rotation detection with OCR verification
-Uses bounding box aspect ratios to determine correct orientation
+Smart PDF rotation detection - Fast version
+3段階判定で高速化
 """
 
 import argparse
@@ -50,23 +50,15 @@ def ocr_request(image_data):
         return None
 
 
-def analyze_orientation(ocr_result):
+def calculate_score(ocr_result):
     """
-    OCR結果から向きの正しさをスコア化
-
-    正しい向き:
-    - 単語のbboxは横長（width > height）→ 横書きテキスト
-    - 日本語文字が多い
-
-    Returns:
-        dict: score, japanese_count, word_count, avg_word_aspect
+    OCR結果からスコア計算
+    スコア = 日本語文字数 × (横書き単語比率 + 0.5)
     """
     if not ocr_result:
-        return {'score': 0, 'japanese_count': 0, 'word_count': 0, 'avg_word_aspect': 0}
+        return 0, {}
 
     pages = ocr_result.get('pages', [])
-    if not pages:
-        return {'score': 0, 'japanese_count': 0, 'word_count': 0, 'avg_word_aspect': 0}
 
     # 単語のアスペクト比を集計
     word_aspects = []
@@ -77,12 +69,10 @@ def analyze_orientation(ocr_result):
                     bbox = word.get('boundingBox', {})
                     vertices = bbox.get('vertices', [])
                     if len(vertices) == 4:
-                        # vertices: [top-left, top-right, bottom-right, bottom-left]
                         width = vertices[1]['x'] - vertices[0]['x']
                         height = vertices[3]['y'] - vertices[0]['y']
                         if height > 0 and width > 0:
-                            aspect = width / height
-                            word_aspects.append(aspect)
+                            word_aspects.append(width / height)
 
     # 日本語文字数
     text = ocr_result.get('text', '')
@@ -91,105 +81,150 @@ def analyze_orientation(ocr_result):
         '\u30A0' <= c <= '\u30FF' or
         '\u4E00' <= c <= '\u9FFF')
 
-    # 平均アスペクト比
-    avg_aspect = sum(word_aspects) / len(word_aspects) if word_aspects else 0
-
-    # スコア計算
-    # - 横長の単語が多い（aspect > 1）→ 正しい向き（横書き）
-    # - 縦長の単語が多い（aspect < 1）→ 90度ずれている
-    horizontal_words = sum(1 for a in word_aspects if a > 1.0)
-    vertical_words = sum(1 for a in word_aspects if a < 1.0)
-
-    # スコア = 日本語文字数 × (横長単語の比率 + 0.5)
+    # 横書き単語の比率
     if word_aspects:
+        horizontal_words = sum(1 for a in word_aspects if a > 1.0)
         horizontal_ratio = horizontal_words / len(word_aspects)
+        avg_aspect = sum(word_aspects) / len(word_aspects)
     else:
         horizontal_ratio = 0.5
+        avg_aspect = 0
 
     score = japanese_count * (horizontal_ratio + 0.5)
 
-    return {
-        'score': round(score, 1),
+    details = {
         'japanese_count': japanese_count,
         'word_count': len(word_aspects),
-        'avg_word_aspect': round(avg_aspect, 2),
-        'horizontal_words': horizontal_words,
-        'vertical_words': vertical_words
+        'avg_aspect': round(avg_aspect, 2),
+        'horizontal_ratio': round(horizontal_ratio, 2)
     }
 
+    return score, details
 
-def detect_rotation_with_ocr(pdf_path):
-    """OCRを使って正しい回転角度を検出"""
+
+def detect_90_or_270(pdf_path, verbose=False):
+    """
+    90度と270度だけOCR比較（高速版）
+    """
+    scores = {}
+    details = {}
+
+    for rotation in [90, 270]:
+        img = pdf_to_image(pdf_path, rotation=rotation, dpi=150)
+        ocr = ocr_request(img)
+        score, det = calculate_score(ocr)
+        scores[rotation] = score
+        details[rotation] = det
+
+        if verbose:
+            print(f"  {rotation}°: score={score:.0f}, jp={det.get('japanese_count', 0)}, "
+                  f"aspect={det.get('avg_aspect', 0)}", file=sys.stderr)
+
+    best = max(scores, key=scores.get)
+    return best, scores, details
+
+
+def detect_rotation_fast(pdf_path, verbose=False):
+    """
+    高速回転判定（3段階）
+
+    Returns:
+        dict: {
+            'rotation': int,
+            'needs_rotation': bool,
+            'method': str,
+            'details': dict
+        }
+    """
     doc = fitz.open(pdf_path)
     page = doc[0]
+
+    # ========================================
+    # STEP 1: メタデータチェック（0.1秒）
+    # ========================================
     meta_rotation = page.rotation
+    if meta_rotation != 0:
+        rotation = (360 - meta_rotation) % 360
+        doc.close()
+        if verbose:
+            print(f"STEP 1: Meta rotation detected: {meta_rotation}° → correct by {rotation}°", file=sys.stderr)
+        return {
+            'rotation': rotation,
+            'needs_rotation': rotation != 0,
+            'method': 'metadata',
+            'details': {'meta_rotation': meta_rotation}
+        }
+
+    # ========================================
+    # STEP 2: アスペクト比チェック（0.1秒）
+    # ========================================
     width = page.rect.width
     height = page.rect.height
     aspect = width / height
     doc.close()
 
-    # メタデータに回転がある場合
-    if meta_rotation != 0:
-        rotation = (360 - meta_rotation) % 360
-        return {
-            'rotation': rotation,
-            'needs_rotation': rotation != 0,
-            'confidence': 'high',
-            'method': 'metadata'
-        }
-
-    # 縦長の場合（正立の可能性が高い）
+    # 明らかに縦長 → 正立
     if aspect < 0.8:
+        if verbose:
+            print(f"STEP 2: Portrait (aspect={aspect:.2f}) → no rotation", file=sys.stderr)
         return {
             'rotation': 0,
             'needs_rotation': False,
-            'confidence': 'high',
-            'method': 'aspect_ratio'
+            'method': 'aspect_portrait',
+            'details': {'aspect': round(aspect, 2)}
         }
 
-    # 横長の場合、4方向すべてでOCRを試行
+    # 正方形に近い → 正立
+    if 0.9 < aspect < 1.1:
+        if verbose:
+            print(f"STEP 2: Square (aspect={aspect:.2f}) → no rotation", file=sys.stderr)
+        return {
+            'rotation': 0,
+            'needs_rotation': False,
+            'method': 'aspect_square',
+            'details': {'aspect': round(aspect, 2)}
+        }
+
+    # ========================================
+    # STEP 3: 横長の場合のみOCR（2回、約10秒）
+    # ========================================
     if aspect > 1.2:
-        print("Testing all orientations with OCR...", file=sys.stderr)
+        if verbose:
+            print(f"STEP 3: Landscape (aspect={aspect:.2f}) → OCR comparison", file=sys.stderr)
 
-        results = {}
-        for rot in [0, 90, 180, 270]:
-            img = pdf_to_image(pdf_path, rotation=rot, dpi=150)
-            ocr = ocr_request(img)
-            analysis = analyze_orientation(ocr)
-            results[rot] = analysis
-            print(f"  {rot}°: score={analysis['score']:.0f}, jp={analysis['japanese_count']}, "
-                  f"words={analysis['word_count']}, aspect={analysis['avg_word_aspect']}", file=sys.stderr)
-
-        # 最高スコアの向きを選択
-        best_rot = max(results.keys(), key=lambda r: results[r]['score'])
-        best = results[best_rot]
+        best, scores, details = detect_90_or_270(pdf_path, verbose)
 
         return {
-            'rotation': best_rot,
-            'needs_rotation': best_rot != 0,
-            'confidence': 'medium',
-            'method': 'ocr_analysis',
-            'scores': {str(k): v['score'] for k, v in results.items()},
-            'best_analysis': best
+            'rotation': best,
+            'needs_rotation': True,
+            'method': 'ocr_comparison',
+            'details': {
+                'aspect': round(aspect, 2),
+                'scores': {str(k): round(v, 1) for k, v in scores.items()},
+                'best_details': details[best]
+            }
         }
 
-    # それ以外
+    # デフォルト（0.8 <= aspect <= 1.2 の中間帯）
+    if verbose:
+        print(f"STEP 2: Moderate aspect ({aspect:.2f}) → no rotation", file=sys.stderr)
     return {
         'rotation': 0,
         'needs_rotation': False,
-        'confidence': 'low',
-        'method': 'default'
+        'method': 'aspect_moderate',
+        'details': {'aspect': round(aspect, 2)}
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smart PDF rotation detection")
+    parser = argparse.ArgumentParser(description="Fast PDF rotation detection")
     parser.add_argument('--input-pdf', required=True, help="Input PDF file path")
+    parser.add_argument('--verbose', '-v', action='store_true', help="Verbose output")
 
     args = parser.parse_args()
 
     try:
-        result = detect_rotation_with_ocr(args.input_pdf)
+        result = detect_rotation_fast(args.input_pdf, verbose=args.verbose)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except Exception as e:

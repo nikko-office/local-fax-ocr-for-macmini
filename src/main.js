@@ -640,7 +640,7 @@ async function normalizeFiles(inputPath) {
       const detection = JSON.parse(detectResult.stdout);
 
       if (!detection.needs_rotation) {
-        log('info', `${basename}: OK (${detection.reason})`);
+        log('info', `${basename}: OK (${detection.method})`);
         skipped++;
         continue;
       }
@@ -655,7 +655,7 @@ async function normalizeFiles(inputPath) {
 
       // Overwrite original
       await fs.rename(tempPath, filePath);
-      log('info', `${basename}: Rotated ${detection.rotation}° (${detection.reason})`);
+      log('info', `${basename}: Rotated ${detection.rotation}° (${detection.method})`);
       rotated++;
 
     } catch (error) {

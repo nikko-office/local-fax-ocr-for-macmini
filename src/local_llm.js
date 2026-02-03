@@ -17,7 +17,9 @@ import {
   LLM_RENAME_VALIDATE_SYSTEM_PROMPT,
   LLM_RENAME_VALIDATE_USER_TEMPLATE,
   LLM_VISION_EXTRACT_SYSTEM_PROMPT,
-  LLM_VISION_EXTRACT_USER_PROMPT
+  LLM_VISION_EXTRACT_USER_PROMPT,
+  LLM_OCR_CORRECT_SYSTEM_PROMPT,
+  LLM_OCR_CORRECT_USER_TEMPLATE
 } from './llm_prompt.js';
 
 // Default settings
@@ -735,4 +737,166 @@ export async function runVisionInference(ocrText, imagePath, options = {}) {
     success: true,
     pipeline
   };
+}
+
+// ========================================
+// Vision-Grounded OCR Correction
+// ========================================
+
+/**
+ * Vision-Grounded OCR Correction
+ *
+ * 画像を真実の情報源として、OCRテキストを補正する
+ *
+ * @param {Array<{bbox: number[], text: string, confidence?: number}>} ocrItems - OCR結果配列
+ * @param {string} imagePath - 画像ファイルパス
+ * @param {Object} options - オプション
+ * @param {string} options.visionModel - Vision モデル名 (default: qwen3-vl)
+ * @returns {Promise<{data: Object|null, success: boolean, error?: string}>}
+ */
+export async function correctOcrWithVision(ocrItems, imagePath, options = {}) {
+  const apiUrl = options.apiUrl || getLlmApiUrl();
+  const model = options.visionModel || 'qwen3-vl';
+  const timeout = options.timeout || 180000; // 3 minutes for large documents
+
+  try {
+    // Prepare OCR items for prompt
+    const ocrItemsJson = JSON.stringify(ocrItems.map((item, index) => ({
+      index,
+      bbox: item.bbox,
+      text: item.text,
+      confidence: item.confidence || null
+    })), null, 2);
+
+    // Read and encode image
+    const imageDataUrl = await imageToBase64DataUrl(imagePath);
+
+    const userPrompt = LLM_OCR_CORRECT_USER_TEMPLATE.replace('{{OCR_ITEMS_JSON}}', ocrItemsJson);
+
+    const requestBody = {
+      model: model,
+      messages: [
+        { role: 'system', content: LLM_OCR_CORRECT_SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: imageDataUrl }
+            },
+            {
+              type: 'text',
+              text: userPrompt
+            }
+          ]
+        }
+      ],
+      temperature: 0,
+      max_tokens: 4096, // Large output for many items
+      stream: false
+    };
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    const response = await fetch(`${apiUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return {
+        data: null,
+        success: false,
+        error: `OCR Correction API error (${response.status}): ${errorText}`
+      };
+    }
+
+    const result = await response.json();
+    const rawOutput = result.choices?.[0]?.message?.content?.trim();
+
+    if (!rawOutput) {
+      return { data: null, success: false, error: 'OCR Correction returned empty response' };
+    }
+
+    const parsed = parseJsonFromLlmOutput(rawOutput);
+    if (!parsed) {
+      return { data: null, success: false, error: `Failed to parse OCR correction JSON: ${rawOutput.substring(0, 300)}` };
+    }
+
+    // Validate output structure
+    if (!parsed.items || !Array.isArray(parsed.items)) {
+      return { data: null, success: false, error: 'Invalid OCR correction output: missing items array' };
+    }
+
+    return { data: parsed, success: true };
+
+  } catch (error) {
+    return {
+      data: null,
+      success: false,
+      error: error.name === 'AbortError' ? 'OCR Correction request timeout' : error.message
+    };
+  }
+}
+
+/**
+ * Apply OCR corrections to original OCR data
+ *
+ * @param {Object} originalOcrData - 元のOCR結果 (.ocr.json の内容)
+ * @param {Object} correctionResult - correctOcrWithVision の結果
+ * @returns {Object} - 補正済みOCR結果
+ */
+export function applyOcrCorrections(originalOcrData, correctionResult) {
+  if (!correctionResult || !correctionResult.items) {
+    return originalOcrData;
+  }
+
+  const correctedData = JSON.parse(JSON.stringify(originalOcrData)); // Deep copy
+  const correctionMap = new Map();
+
+  // Build correction map by index
+  for (const item of correctionResult.items) {
+    if (item.action === 'corrected' && item.corrected_text) {
+      correctionMap.set(item.index, item.corrected_text);
+    }
+  }
+
+  // Apply corrections to lines array
+  if (correctedData.lines && Array.isArray(correctedData.lines)) {
+    correctedData.lines = correctedData.lines.map((line, index) => {
+      if (correctionMap.has(index)) {
+        return {
+          ...line,
+          text: correctionMap.get(index),
+          corrected: true,
+          original_text: line.text
+        };
+      }
+      return line;
+    });
+  }
+
+  // Update full_text
+  if (correctedData.lines) {
+    correctedData.full_text = correctedData.lines.map(l => l.text).join('\n');
+  }
+
+  // Add correction metadata
+  correctedData.correction = {
+    method: correctionResult.method || 'IMAGE_AND_TEXT_CROSSCHECK',
+    summary: correctionResult.summary || {
+      total: correctionResult.items.length,
+      corrected: correctionResult.items.filter(i => i.action === 'corrected').length,
+      unchanged: correctionResult.items.filter(i => i.action === 'unchanged').length
+    },
+    applied_at: new Date().toISOString()
+  };
+
+  return correctedData;
 }

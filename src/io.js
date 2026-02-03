@@ -98,12 +98,13 @@ export async function listInputFiles(dirPath) {
  * @param {string} pdfPath - Input PDF path
  * @param {string} outputDir - Output directory
  * @param {number} dpi - Resolution (default: 200)
+ * @param {string} outputBasename - Output basename (default: derived from pdfPath)
  * @returns {Promise<string>} - Path to generated PNG
  */
-export async function pdfToPng(pdfPath, outputDir, dpi = 200) {
+export async function pdfToPng(pdfPath, outputDir, dpi = 200, outputBasename = null) {
   await ensureDir(outputDir);
 
-  const basename = path.basename(pdfPath, path.extname(pdfPath));
+  const basename = outputBasename || path.basename(pdfPath, path.extname(pdfPath));
   const outputPath = path.join(outputDir, `${basename}.png`);
 
   // pdftocairo -png -r <dpi> -f 1 -l 1 input.pdf output_prefix
