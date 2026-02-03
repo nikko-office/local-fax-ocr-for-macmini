@@ -54,9 +54,10 @@ const EXIT_INPUT_ERROR = 2;
 function parseCliArgs() {
   const args = process.argv.slice(2);
 
-  // Check for 'process' subcommand
+  // Check for subcommands
   const isProcessCommand = args[0] === 'process';
-  const argsToProcess = isProcessCommand ? args.slice(1) : args;
+  const isNormalizeCommand = args[0] === 'normalize';
+  const argsToProcess = (isProcessCommand || isNormalizeCommand) ? args.slice(1) : args;
 
   const options = {
     in: { type: 'string', default: isProcessCommand ? undefined : './input' },
@@ -74,6 +75,7 @@ function parseCliArgs() {
     'ocr-correct': { type: 'boolean', default: false },
     rotate: { type: 'string', default: '0' },
     'auto-rotate': { type: 'boolean', default: false },
+    overwrite: { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
     version: { type: 'boolean', short: 'v', default: false }
   };
@@ -81,7 +83,7 @@ function parseCliArgs() {
   try {
     const { values } = parseArgs({ options, args: argsToProcess, allowPositionals: false });
     return {
-      command: isProcessCommand ? 'process' : 'batch',
+      command: isNormalizeCommand ? 'normalize' : (isProcessCommand ? 'process' : 'batch'),
       inputPath: values.in,
       outputDir: values.out,
       applyRename: values['apply-rename'],
@@ -97,6 +99,7 @@ function parseCliArgs() {
       ocrCorrect: values['ocr-correct'],
       rotate: parseInt(values.rotate, 10),
       autoRotate: values['auto-rotate'],
+      overwrite: values.overwrite,
       help: values.help,
       version: values.version
     };
@@ -115,8 +118,9 @@ function printUsage() {
 FaxOCR-JS - FAX PDF/画像のOCR & リネーム提案ツール
 
 Usage:
-  node src/main.js [options]                    # バッチ処理（フォルダ）
-  node src/main.js process --in <file> [options]  # 単一ファイル処理
+  node src/main.js [options]                       # バッチ処理（フォルダ）
+  node src/main.js process --in <file> [options]   # 単一ファイル処理
+  node src/main.js normalize --in <path>           # PDF正立化（横長→縦長）
 
 Options:
   --in <path>         入力ファイル/ディレクトリ (default: ./input)
@@ -136,6 +140,7 @@ Options:
   --font-path <path>  日本語フォントファイルパス（searchable-pdf用）
   --rotate <degrees>  PDF回転角度（0, 90, 180, 270）時計回り (default: 0)
   --auto-rotate       横長PDFを自動検出して90°回転（FAX文書向け）
+  --overwrite         元ファイルをsearchable PDFで上書き
   -h, --help          ヘルプを表示
   -v, --version       バージョンを表示
 
@@ -554,6 +559,12 @@ doc.close()
           await runPythonScript('searchable_pdf.py', pythonArgs);
           result.searchable_pdf = searchablePdfPath;
           log('info', `  Saved: ${basename}.searchable.pdf`);
+
+          // Overwrite original file with searchable PDF
+          if (args.overwrite) {
+            await fs.copyFile(searchablePdfPath, filePath);
+            log('info', `  Overwritten: ${path.basename(filePath)}`);
+          }
         } catch (error) {
           log('error', `  Searchable PDF failed: ${error.message}`);
         }
@@ -585,6 +596,79 @@ doc.close()
       error: error.message
     };
   }
+}
+
+/**
+ * Normalize PDFs (detect and apply rotation)
+ */
+async function normalizeFiles(inputPath) {
+  // Get list of files
+  let files;
+  try {
+    const stat = await fs.stat(inputPath);
+    if (stat.isDirectory()) {
+      files = await listInputFiles(inputPath);
+      files = files.filter(f => isPdf(f));
+    } else {
+      files = [inputPath];
+    }
+  } catch (error) {
+    console.error(`Error: Cannot access input: ${inputPath}`);
+    process.exit(EXIT_INPUT_ERROR);
+  }
+
+  if (files.length === 0) {
+    console.log('No PDF files found');
+    process.exit(EXIT_SUCCESS);
+  }
+
+  console.log(`Found ${files.length} PDF file(s) to normalize`);
+  console.log('');
+
+  let rotated = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  for (const filePath of files) {
+    const basename = path.basename(filePath);
+
+    try {
+      // Detect rotation
+      const detectResult = await runPythonScript('smart_auto_rotate.py', [
+        '--input-pdf', filePath
+      ]);
+      const detection = JSON.parse(detectResult.stdout);
+
+      if (!detection.needs_rotation) {
+        log('info', `${basename}: OK (${detection.reason})`);
+        skipped++;
+        continue;
+      }
+
+      // Apply rotation
+      const tempPath = filePath + '.tmp';
+      await runPythonScript('rotate_pdf.py', [
+        '--input-pdf', filePath,
+        '--output-pdf', tempPath,
+        '--degrees', String(detection.rotation)
+      ]);
+
+      // Overwrite original
+      await fs.rename(tempPath, filePath);
+      log('info', `${basename}: Rotated ${detection.rotation}° (${detection.reason})`);
+      rotated++;
+
+    } catch (error) {
+      log('error', `${basename}: ${error.message}`);
+      errors++;
+    }
+  }
+
+  console.log('');
+  console.log('='.repeat(50));
+  console.log(`Summary: ${rotated} rotated, ${skipped} skipped, ${errors} errors`);
+
+  process.exit(errors > 0 ? 1 : EXIT_SUCCESS);
 }
 
 /**
@@ -659,6 +743,16 @@ async function main() {
 
   // Get API key
   const apiKey = process.env.GOOGLE_CLOUD_API_KEY;
+
+  // Handle 'normalize' command
+  if (args.command === 'normalize') {
+    if (!args.inputPath) {
+      console.error('Error: --in <path> is required for normalize command');
+      process.exit(EXIT_CONFIG_ERROR);
+    }
+    await normalizeFiles(args.inputPath);
+    return;
+  }
 
   // Handle 'process' command (single file, JSON output)
   if (args.command === 'process') {
